@@ -5,7 +5,7 @@ import os
 
 
 # Set this to "GCP" or "AWS" (or use an env var: DB_PLATFORM=GCP/AWS)
-PLATFORM = os.getenv("DB_PLATFORM", "AWS").upper()
+PLATFORM = os.getenv("DB_PLATFORM", "GCP").upper()
 
 def getconn():
     if PLATFORM == "GCP":
