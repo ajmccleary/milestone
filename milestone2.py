@@ -8,6 +8,8 @@ import seaborn as sns
 import plotly.express as px
 from google.cloud.sql.connector import Connector
 
+# Authors: Andrew McCleary and Brady Galligan
+
 # Set this to "GCP" or "AWS" (or use an env var: DB_PLATFORM=GCP/AWS)
 PLATFORM = os.getenv("DB_PLATFORM", "GCP").upper()
 
@@ -32,10 +34,10 @@ def setup_db(cur):
     cur.execute('CREATE DATABASE IF NOT EXISTS nobel_prizes_db;')
     cur.execute('USE nobel_prizes_db;')
 
+    cur.execute('DROP TABLE IF EXISTS NobelPrize_Laureates;')
+    cur.execute('DROP TABLE IF EXISTS NobelPrize;')
     cur.execute('DROP TABLE IF EXISTS Category;')
     cur.execute('DROP TABLE IF EXISTS Laureates;')    
-    cur.execute('DROP TABLE IF EXISTS NobelPrize;')
-    cur.execute('DROP TABLE IF EXISTS NobelPrize_Laureates;')
 
     cur.execute('''
         CREATE TABLE Category (
@@ -66,49 +68,115 @@ def setup_db(cur):
         FOREIGN KEY(LaureateId) REFERENCES Laureates(LaureateId)
         );''')
 
-# def insert_data(cur):
-    # cur.execute('USE roster_db')
+def insert_data(cur):
+    cur.execute('USE nobel_prizes_db')
 
-    # fname = 'roster_data.json'
+    req = requests.get("https://api.nobelprize.org/v1/prize.json")
+    data = req.json()
 
-    # #Data structure as follows:
-    # #   [
-    # #   [ "Charley", "si110", 1 ],
-    # #   [ "Mea", "si110", 0 ],
+    prizes = data['prizes']
+    rows = []
+    for p in prizes:
+        year = int(p.get('year')) if p.get('year') and p.get('year').isdigit() else None
+        category = p.get('category')
+        laureates = p.get('laureates') or []
+        if laureates:
+            for l in laureates:
+                rows.append({
+                    'year': year,
+                    'category': category,
+                    'laureate_id': l.get('id'),
+                    'firstname': l.get('firstname'),
+                    'surname': l.get('surname'),
+                    'motivation': l.get('motivation'),
+                    'share': int(l.get('share')) if l.get('share') and l.get('share').isdigit() else None
+                })
+        else:
+            # some prizes may have no laureates listed — include as prize-only row
+            rows.append({'year': year, 'category': category, 'laureate_id': None,
+                         'firstname': None, 'surname': None, 'motivation': None, 'share': None})
 
-    # # open the file and read 
-    # str_data = open(fname).read()
-    # # load the data in a json object
-    # json_data = json.loads(str_data)
-
-    # #json data is loaded in a pyton list
-    # for entry in json_data:
-
-    #     name = entry[0]
-    #     title = entry[1]
-
-    #     print(name)
-    #     print(title)
-
-    #     # INSERT OR IGNORE satisfies the uniqueness constraint. the inserted data will be ignored if we try to add duplicates.
-    #     # works as both insert and update
-    #     cur.execute('''INSERT IGNORE INTO User (name)  
-    #         VALUES ( %s )''', (name) )
+    # Insert unique categories using executemany
+    categories = set(row['category'] for row in rows if row['category'])
+    category_data = [(category,) for category in categories]
+    cur.executemany('INSERT IGNORE INTO Category (Name) VALUES (%s)', category_data)
+    
+    # Create mapping of category names to IDs
+    category_id_map = {}
+    for category in categories:
+        cur.execute('SELECT CategoryId FROM Category WHERE Name = %s', (category,))
+        result = cur.fetchone()
+        if result:
+            category_id_map[category] = result[0]
+    
+    # Batch insert laureates
+    unique_laureates = {}
+    for row in rows:
+        if row['laureate_id'] and row['laureate_id'] not in unique_laureates:
+            unique_laureates[row['laureate_id']] = (row['firstname'], row['surname'])
+    
+    laureate_data = [(firstname, surname) for firstname, surname in unique_laureates.values()]
+    cur.executemany('''INSERT IGNORE INTO Laureates (FirstName, LastName) 
+                      VALUES (%s, %s)''', laureate_data)
+    
+    # Create laureate ID mapping
+    laureate_id_map = {}
+    for laureate_id, (firstname, surname) in unique_laureates.items():
+        cur.execute('SELECT LaureateId FROM Laureates WHERE FirstName = %s AND LastName = %s', 
+                   (firstname, surname))
+        result = cur.fetchone()
+        if result:
+            laureate_id_map[laureate_id] = result[0]
+    
+    # Batch insert Nobel Prizes
+    unique_prizes = set()
+    for row in rows:
+        if row['year'] and row['category']:
+            unique_prizes.add((row['year'], row['category']))
+    
+    prize_data = [(year, category_id_map[category]) for year, category in unique_prizes]
+    cur.executemany('''INSERT IGNORE INTO NobelPrize (Year, CategoryId) 
+                      VALUES (%s, %s)''', prize_data)
+    
+    # Create prize ID mapping
+    prize_map = {}
+    for year, category in unique_prizes:
+        category_id = category_id_map[category]
+        cur.execute('SELECT PrizeId FROM NobelPrize WHERE Year = %s AND CategoryId = %s', 
+                   (year, category_id))
+        result = cur.fetchone()
+        if result:
+            prize_map[(year, category)] = result[0]
+    
+    # Batch insert into NobelPrize_Laureates junction table
+    junction_data = []
+    for row in rows:
+        if row['laureate_id'] and row['year'] and row['category']:
+            key = (row['year'], row['category'])
+            prize_id = prize_map.get(key)
+            laureate_id = laureate_id_map.get(row['laureate_id'])
             
-    #     # look up the primary key from inserted data.		
-    #     cur.execute('SELECT id FROM User WHERE name = %s ', (name, ))
-    #     user_id = cur.fetchone()[0]
+            if prize_id and laureate_id:
+                junction_data.append((row['motivation'], row['share'], prize_id, laureate_id))
+    
+    # THIS IS THE KEY PERFORMANCE LINE - batch insert all junction records at once
+    cur.executemany('''INSERT IGNORE INTO NobelPrize_Laureates 
+                      (Motivation, Share, PrizeId, LaureateId) 
+                      VALUES (%s, %s, %s, %s)''', junction_data)
 
-    #     # same technique is used to insert the title
-    #     cur.execute('''INSERT IGNORE INTO Course (title) 
-    #         VALUES ( %s )''', ( title, ) )
-    #     cur.execute('SELECT id FROM Course WHERE title = %s ', (title, ))
-    #     course_id = cur.fetchone()[0]
-        
-    #     #insert both keys in the many to many connector table.
-    #     cur.execute('''INSERT IGNORE INTO Member
-    #         (user_id, course_id) VALUES ( %s, %s )''', 
-    #         ( user_id, course_id ) )
+def select_all_data(cur):
+    cur.execute('USE nobel_prizes_db')
+    cur.execute('''
+        SELECT np.Year, c.Name AS Category, l.FirstName, l.LastName, npl.Motivation, npl.Share
+        FROM NobelPrize_Laureates npl
+        JOIN NobelPrize np ON npl.PrizeId = np.PrizeId
+        JOIN Category c ON np.CategoryId = c.CategoryId
+        JOIN Laureates l ON npl.LaureateId = l.LaureateId
+        ORDER BY np.Year, c.Name;
+    ''')
+    results = cur.fetchall()
+    for row in results:
+        print(row)
 
 # ----- MAIN PROGRAM -----
 with getconn() as conn:
@@ -116,93 +184,6 @@ with getconn() as conn:
         print("Connected to GCP Cloud SQL")
     with conn.cursor() as cur:
         setup_db(cur)
-        # insert_data(cur)
+        insert_data(cur)
+        select_all_data(cur)
         conn.commit()
-
-# req = requests.get("https://api.nobelprize.org/v1/prize.json")
-# data = req.json()
-
-# #Janky simmed SQL thing (converting JSON to actual accessible variables)
-# prizes = data['prizes']
-# #Stolen bastardized StackOverflow code to make the JSON file actually accessible in Python (I miss R)
-# rows = []
-# for p in prizes:
-#     year = int(p.get('year')) if p.get('year') and p.get('year').isdigit() else None
-#     category = p.get('category')
-#     laureates = p.get('laureates') or []
-#     if laureates:
-#         for l in laureates:
-#             rows.append({
-#                 'year': year,
-#                 'category': category,
-#                 'laureate_id': l.get('id'),
-#                 'firstname': l.get('firstname'),
-#                 'surname': l.get('surname'),
-#                 'motivation': l.get('motivation'),
-#                 'share': int(l.get('share')) if l.get('share') and l.get('share').isdigit() else None
-#             })
-#     else:
-#         # some prizes may have no laureates listed — include as prize-only row
-#         rows.append({'year': year, 'category': category, 'laureate_id': None,
-#                      'firstname': None, 'surname': None, 'motivation': None, 'share': None})
-
-# df = pd.DataFrame(rows)
-# df['fullname'] = df[['firstname','surname']].fillna('').agg(' '.join, axis=1).str.strip()
-# df.head()
-
-
-# # compute number of laureates per prize (year+category defines a single prize)
-# prize_counts = df.groupby(['year','category']).agg(laureates_per_prize=('laureate_id','nunique')).reset_index()
-# yearly = prize_counts.groupby('year').laureates_per_prize.mean().reset_index()
-
-# plt.figure(figsize=(12,5))
-# sns.lineplot(data=yearly, x='year', y='laureates_per_prize', marker='o')
-# plt.title('Average laureates per prize by year')
-# plt.xlabel('Year')
-# plt.ylabel('Avg laureates per prize')
-# plt.xlim(min(yearly.year), max(yearly.year))
-# plt.show()
-
-# # count unique prizes by category: unique (year,category) pairs
-# prizes_per_cat = df.groupby('category').apply(lambda g: g[['year','category']].drop_duplicates().shape[0]).reset_index(name='prize_count')
-# prizes_per_cat = prizes_per_cat.sort_values('prize_count', ascending=False)
-
-# plt.figure(figsize=(10,6))
-# sns.barplot(data=prizes_per_cat, y='category', x='prize_count')
-# plt.title('Total prizes awarded per category')
-# plt.xlabel('Number of prizes')
-# plt.ylabel('Category')
-# plt.show()
-
-# prizes_per_year = df.groupby(['year','category']).size().reset_index(name='count').groupby('year').size().reset_index(name='prizes_count')
-# # simpler: unique (year,category)
-# prizes_per_year = df[['year','category']].drop_duplicates().groupby('year').size().reset_index(name='prizes_count')
-
-# plt.figure(figsize=(12,5))
-# sns.barplot(data=prizes_per_year, x='year', y='prizes_count')
-# plt.xticks(rotation=90)
-# plt.title('Prizes awarded per year')
-# plt.xlabel('Year')
-# plt.ylabel('Number of prizes')
-# plt.show()
-
-# categories_per_year = df[['year','category']].drop_duplicates().groupby('year').size().reset_index(name='num_categories')
-
-# plt.figure(figsize=(12,4))
-# sns.lineplot(data=categories_per_year, x='year', y='num_categories', marker='o')
-# plt.title('Number of categories with awards each year')
-# plt.xlabel('Year')
-# plt.ylabel('Number of categories')
-# plt.show()
-
-# # Count distinct (year,category) per laureate (some laureates have multiple prizes)
-# recurring = df.dropna(subset=['laureate_id']).groupby(['fullname']).apply(lambda g: g[['year','category']].drop_duplicates().shape[0]).reset_index(name='prize_count')
-# recurring = recurring[recurring['prize_count'] > 1].sort_values('prize_count', ascending=False)
-# recurring.head(20)
-# top_recurring = recurring.head(10)
-# plt.figure(figsize=(10,5))
-# sns.barplot(data=top_recurring, x='prize_count', y='fullname')
-# plt.title('Top recurring laureates (more than one prize)')
-# plt.xlabel('Number of distinct prizes')
-# plt.ylabel('Laureate')
-# plt.show()
